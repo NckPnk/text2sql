@@ -24,8 +24,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
-import httpx
 import chromadb
+import ollama
 from dotenv import load_dotenv
 
 
@@ -215,39 +215,32 @@ def table_to_metadata(tbl: TableInfo) -> dict:
 
 def get_embeddings(texts: list[str]) -> list[list[float]]:
     """Получает embeddings через Ollama API."""
-    with httpx.Client(timeout=120.0) as client:
-        response = client.post(
-            f"{OLLAMA_URL}/api/embed",
-            json={
-                "model": EMBED_MODEL,
-                "input": texts,
-            }
-        )
-        response.raise_for_status()
-        return response.json()["embeddings"]
+    client = ollama.Client(host=OLLAMA_URL, timeout=120.0)
+    response = client.embed(model=EMBED_MODEL, input=texts)
+    return response["embeddings"]
 
 
 def check_ollama() -> bool:
     """Проверяет доступность Ollama и наличие модели."""
     try:
-        with httpx.Client(timeout=10.0) as client:
-            # Проверяем, что Ollama запущена
-            resp = client.get(f"{OLLAMA_URL}/api/tags")
-            resp.raise_for_status()
-            models = [m["name"] for m in resp.json().get("models", [])]
+        client = ollama.Client(host=OLLAMA_URL, timeout=10.0)
+        resp = client.list()
+        models = [
+            model.get("name", model.get("model", ""))
+            for model in resp.get("models", [])
+        ]
 
-            if not any(EMBED_MODEL.split(":")[0] in m for m in models):
-                print(f"❌ Модель {EMBED_MODEL} не найдена в Ollama!")
-                print(f"   Доступные модели: {models}")
-                print(f"   Выполните: ollama pull {EMBED_MODEL}")
-                return False
+        if not any(EMBED_MODEL.split(":")[0] in m for m in models):
+            print(f"❌ Модель {EMBED_MODEL} не найдена в Ollama!")
+            print(f"   Доступные модели: {models}")
+            print(f"   Выполните: ollama pull {EMBED_MODEL}")
+            return False
 
-            # Тестовый embedding
-            test = get_embeddings(["тест"])
-            print(f"   Размерность embedding: {len(test[0])}")
-            return True
-
-    except httpx.ConnectError:
+        # Тестовый embedding
+        test = get_embeddings(["тест"])
+        print(f"   Размерность embedding: {len(test[0])}")
+        return True
+    except ConnectionError:
         print(f"❌ Ollama недоступна по адресу {OLLAMA_URL}")
         print(f"   Убедитесь, что Ollama запущена: ollama serve")
         return False

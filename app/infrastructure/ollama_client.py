@@ -1,13 +1,13 @@
-"""HTTP client for Ollama LLM and embedding APIs."""
+"""Client for Ollama LLM and embedding APIs via official SDK."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
 
-import httpx
+import asyncio
+import ollama
 
 from app.core.config import Settings
 from app.core.exceptions import LLMError
@@ -25,12 +25,12 @@ class OllamaClient:
         self._llm_timeout = settings.llm_timeout
         self._embed_timeout = settings.embed_timeout
 
-        self._llm_client = httpx.AsyncClient(
-            base_url=self._base_url,
+        self._llm_client = ollama.AsyncClient(
+            host=self._base_url,
             timeout=self._llm_timeout,
         )
-        self._embed_client = httpx.AsyncClient(
-            base_url=self._base_url,
+        self._embed_client = ollama.AsyncClient(
+            host=self._base_url,
             timeout=self._embed_timeout,
         )
 
@@ -42,41 +42,35 @@ class OllamaClient:
             len(prompt),
             len(system),
         )
-        payload = {
-            "model": self._llm_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "num_predict": 4096,
-            },
-        }
         started_at = time.perf_counter()
 
         try:
-            response = await self._request_with_retry(
+            response = await self._chat_with_retry(
                 client=self._llm_client,
-                method="POST",
-                url="/api/chat",
-                json_data=payload,
+                max_retries=2,
+                model=self._llm_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                options={
+                    "temperature": 0.1,
+                    "num_predict": 4096,
+                },
             )
-            response_json = response.json()
-            content = response_json["message"]["content"]
+            content = response["message"]["content"]
             if not content:
                 raise LLMError("LLM вернула пустой ответ")
-        except httpx.TimeoutException as exc:
+        except TimeoutError as exc:
             message = f"Ollama таймаут ({self._llm_timeout}с)"
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
-        except httpx.ConnectError as exc:
-            message = f"Ollama недоступна: {self._base_url}"
+        except ollama.ResponseError as exc:
+            message = self._build_llm_http_error(exc, self._llm_model)
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
-        except httpx.HTTPStatusError as exc:
-            message = self._build_llm_http_error(exc, self._llm_model)
+        except ConnectionError as exc:
+            message = f"Ollama недоступна: {self._base_url}"
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
         except LLMError as exc:
@@ -100,32 +94,26 @@ class OllamaClient:
         """Fetch embedding vector from Ollama embed API."""
 
         logger.debug("Generating embedding for text_length=%s", len(text))
-        payload = {
-            "model": self._embed_model,
-            "input": text,
-        }
-
         try:
-            response = await self._request_with_retry(
+            response = await self._embed_with_retry(
                 client=self._embed_client,
-                method="POST",
-                url="/api/embed",
-                json_data=payload,
+                max_retries=2,
+                model=self._embed_model,
+                input=text,
             )
-            response_json = response.json()
-            embedding = response_json["embeddings"][0]
+            embedding = response["embeddings"][0]
             if not embedding:
                 raise LLMError("Embedding вернула пустой вектор")
-        except httpx.TimeoutException as exc:
+        except TimeoutError as exc:
             message = f"Ollama embedding таймаут ({self._embed_timeout}с)"
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
-        except httpx.ConnectError as exc:
-            message = f"Ollama embedding недоступна: {self._base_url}"
+        except ollama.ResponseError as exc:
+            message = self._build_embedding_http_error(exc, self._embed_model)
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
-        except httpx.HTTPStatusError as exc:
-            message = self._build_embedding_http_error(exc, self._embed_model)
+        except ConnectionError as exc:
+            message = f"Ollama embedding недоступна: {self._base_url}"
             logger.error(message, exc_info=exc)
             raise LLMError(message) from exc
         except LLMError as exc:
@@ -143,36 +131,67 @@ class OllamaClient:
         """Check whether Ollama responds to a basic availability probe."""
 
         try:
-            response = await self._llm_client.get("/api/tags", timeout=5.0)
-        except httpx.HTTPError:
+            await self._llm_client.list()
+        except Exception:
             return False
-        return response.status_code == 200
+        return True
 
     async def close(self) -> None:
-        """Close underlying HTTP clients."""
+        """SDK clients are stateless, nothing to close."""
 
-        await self._llm_client.aclose()
-        await self._embed_client.aclose()
+    async def _chat_with_retry(
+        self,
+        client: ollama.AsyncClient,
+        max_retries: int = 2,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Send chat requests with retries for Ollama 5xx responses."""
+
+        return await self._request_with_retry(
+            requester=client.chat,
+            max_retries=max_retries,
+            include_stream=True,
+            **kwargs,
+        )
+
+    async def _embed_with_retry(
+        self,
+        client: ollama.AsyncClient,
+        max_retries: int = 2,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Send embedding requests with retries for Ollama 5xx responses."""
+
+        return await self._request_with_retry(
+            requester=client.embed,
+            max_retries=max_retries,
+            include_stream=False,
+            **kwargs,
+        )
 
     async def _request_with_retry(
         self,
-        client: httpx.AsyncClient,
-        method: str,
-        url: str,
-        json_data: dict[str, Any],
+        requester: Any,
         max_retries: int = 2,
-    ) -> httpx.Response:
+        include_stream: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Send request with retries for Ollama 5xx responses."""
 
         last_status_code: int | None = None
 
         for attempt in range(1, max_retries + 2):
-            response = await client.request(method=method, url=url, json=json_data)
-            if response.status_code < 500:
-                response.raise_for_status()
+            try:
+                if include_stream:
+                    response = await requester(stream=False, **kwargs)
+                else:
+                    response = await requester(**kwargs)
                 return response
+            except ollama.ResponseError as exc:
+                last_status_code = getattr(exc, "status_code", None)
+                if not last_status_code or last_status_code < 500:
+                    raise
 
-            last_status_code = response.status_code
             if attempt > max_retries:
                 break
 
@@ -184,13 +203,13 @@ class OllamaClient:
         )
 
     @staticmethod
-    def _build_llm_http_error(exc: httpx.HTTPStatusError, model: str) -> str:
-        if exc.response.status_code == 404:
+    def _build_llm_http_error(exc: ollama.ResponseError, model: str) -> str:
+        if getattr(exc, "status_code", None) == 404:
             return f"Модель {model} не найдена в Ollama"
-        return f"Ollama LLM HTTP ошибка: {exc.response.status_code}"
+        return f"Ollama LLM HTTP ошибка: {getattr(exc, 'status_code', 'unknown')}"
 
     @staticmethod
-    def _build_embedding_http_error(exc: httpx.HTTPStatusError, model: str) -> str:
-        if exc.response.status_code == 404:
+    def _build_embedding_http_error(exc: ollama.ResponseError, model: str) -> str:
+        if getattr(exc, "status_code", None) == 404:
             return f"Модель {model} не найдена в Ollama"
-        return f"Ollama embedding HTTP ошибка: {exc.response.status_code}"
+        return f"Ollama embedding HTTP ошибка: {getattr(exc, 'status_code', 'unknown')}"

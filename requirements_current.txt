@@ -43,10 +43,11 @@ opentelemetry-proto==1.41.0
 opentelemetry-sdk==1.41.0
 opentelemetry-semantic-conventions==0.62b0
 orjson==3.11.8
+ollama==0.6.0
 overrides==7.7.0
 packaging==26.0
 protobuf==6.33.6
-psycopg2-binary==2.9.11
+psycopg[binary]==3.2.10
 pybase64==1.4.3
 pydantic==2.12.5
 pydantic-settings==2.13.1

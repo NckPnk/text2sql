@@ -11,7 +11,8 @@ from typing import Any, Literal
 
 import chromadb
 import httpx
-import psycopg2
+import ollama
+import psycopg
 from pydantic import ValidationError
 
 
@@ -50,7 +51,7 @@ class SmokeTestRunner:
         self._ollama_available = False
         self._db_connected = False
         self._db_search_path: str | None = None
-        self._db_connection: psycopg2.extensions.connection | None = None
+        self._db_connection: psycopg.Connection[Any] | None = None
         self._chroma_count: int | None = None
         self._xdic_count: int | None = None
 
@@ -112,34 +113,36 @@ class SmokeTestRunner:
     def _check_ollama(self) -> None:
         started = time.perf_counter()
         try:
-            with httpx.Client(base_url=self.settings.ollama_base_url, timeout=5.0) as client:
-                response = client.get("/api/tags")
-                response.raise_for_status()
-                models = response.json().get("models", [])
-                model_names = {model.get("name", "") for model in models}
-                self._ollama_available = True
-                self._add_result(
-                    "ollama_api",
-                    "Ollama API",
-                    "ok",
-                    "доступен",
-                    started,
-                )
+            client = ollama.Client(host=self.settings.ollama_base_url, timeout=5.0)
+            response = client.list()
+            models = response.get("models", [])
+            model_names = {
+                model.get("name", model.get("model", ""))
+                for model in models
+            }
+            self._ollama_available = True
+            self._add_result(
+                "ollama_api",
+                "Ollama API",
+                "ok",
+                "доступен",
+                started,
+            )
 
-                self._record_model_check(
-                    started_at=None,
-                    key="ollama_llm_model",
-                    label="Модель LLM",
-                    model_name=self.settings.llm_model,
-                    available_models=model_names,
-                )
-                self._record_model_check(
-                    started_at=None,
-                    key="ollama_embed_model",
-                    label="Модель Embedding",
-                    model_name=self.settings.embed_model,
-                    available_models=model_names,
-                )
+            self._record_model_check(
+                started_at=None,
+                key="ollama_llm_model",
+                label="Модель LLM",
+                model_name=self.settings.llm_model,
+                available_models=model_names,
+            )
+            self._record_model_check(
+                started_at=None,
+                key="ollama_embed_model",
+                label="Модель Embedding",
+                model_name=self.settings.embed_model,
+                available_models=model_names,
+            )
         except Exception as exc:
             self._ollama_available = False
             self._add_result(
@@ -191,7 +194,7 @@ class SmokeTestRunner:
         search_path = self._quoted_search_path()
 
         try:
-            self._db_connection = psycopg2.connect(
+            self._db_connection = psycopg.connect(
                 host=self.settings.db_host,
                 port=self.settings.db_port,
                 dbname=self.settings.db_name,
