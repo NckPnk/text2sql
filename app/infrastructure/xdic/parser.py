@@ -13,8 +13,8 @@ import xml.etree.ElementTree as ET
 import re
 from dataclasses import dataclass, field
 from typing import Optional
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 
 # ─────────────────────────────────────────────
@@ -285,7 +285,7 @@ class XdicParser:
         dsn — строка подключения, например:
           "host=localhost port=5432 dbname=mydb user=admin password=secret"
         """
-        self._conn = psycopg2.connect(dsn)
+        self._conn = psycopg.connect(dsn)
         return self
 
     def close_db(self):
@@ -350,7 +350,7 @@ class XdicParser:
 
     def _enrich_columns(self, tbl: TableInfo, real_name: str):
         """Заполняет реальные типы колонок из information_schema."""
-        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        cur = self._conn.cursor(row_factory=dict_row)
         try:
             cur.execute("""
                 SELECT column_name, data_type, is_nullable,
@@ -442,7 +442,7 @@ class XdicParser:
         if not tbl or not tbl.db_real_name:
             return {}
 
-        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        cur = self._conn.cursor(row_factory=dict_row)
         try:
             query = f"""
                 SELECT
