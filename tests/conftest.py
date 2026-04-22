@@ -48,6 +48,7 @@ def db_client_mock() -> AsyncMock:
 def chroma_client_mock() -> Mock:
     client = Mock()
     client.search = Mock(return_value=[])
+    client.search_columns = Mock(return_value=[])
     return client
 
 
