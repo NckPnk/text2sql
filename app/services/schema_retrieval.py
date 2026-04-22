@@ -5,7 +5,7 @@ from typing import Any
 
 from app.core.exceptions import SchemaRetrievalError
 from app.core.interfaces import EmbeddingClient, VectorStore
-from app.core.models import SearchResult, TableContext
+from app.core.models import ColumnSearchResult, SearchResult, TableContext
 from app.infrastructure.xdic.parser import XdicParser
 
 logger = logging.getLogger(__name__)
@@ -31,17 +31,20 @@ class SchemaRetrievalService:
                 f"Не удалось получить эмбеддинг: {detail}"
             ) from exc
 
-        search_results = self._vector_store.search(embedding, n_results=max_tables)
-        self._log_search_results(search_results)
-        if not search_results:
+        table_hits = self._vector_store.search(embedding, n_results=max_tables * 2)
+        column_hits = self._vector_store.search_columns(embedding, n_results=max_tables * 10)
+        self._log_search_results(table_hits, column_hits)
+        if not table_hits and not column_hits:
             raise SchemaRetrievalError("Не найдено релевантных таблиц")
 
+        ranked_tables = self._rank_tables(table_hits, column_hits)
         primary_tables: dict[str, dict[str, Any]] = {}
-        for search_result in search_results:
-            table_name = search_result.table_name
-            table_payload = self._load_table_payload(table_name, score=search_result.score)
+        for table_name, payload in ranked_tables[:max_tables]:
+            table_payload = self._load_table_payload(table_name, score=payload["total_score"])
             if table_payload is None:
                 continue
+            table_payload["matched_columns"] = payload["matched_columns"]
+            table_payload["score_components"] = payload["score_components"]
             primary_tables[table_name] = table_payload
 
         if not primary_tables:
@@ -65,6 +68,8 @@ class SchemaRetrievalService:
             table_payload = self._load_table_payload(table_name, score=0.0)
             if table_payload is None:
                 continue
+            table_payload["matched_columns"] = []
+            table_payload["score_components"] = {"relation_support": float(related_candidates[table_name])}
             expanded_tables[table_name] = table_payload
 
         selected_tables = {**primary_tables, **expanded_tables}
@@ -86,6 +91,8 @@ class SchemaRetrievalService:
                 description=payload["description"],
                 relevance_score=payload["score"],
                 relations=relations_by_table.get(table_name, []),
+                matched_columns=payload.get("matched_columns", []),
+                score_components=payload.get("score_components", {}),
             )
             for table_name, payload in selected_tables.items()
         ]
@@ -107,12 +114,99 @@ class SchemaRetrievalService:
 
         return contexts
 
-    def _log_search_results(self, search_results: list[SearchResult]) -> None:
+    def _log_search_results(
+        self,
+        table_hits: list[SearchResult],
+        column_hits: list[ColumnSearchResult],
+    ) -> None:
         logger.debug(
-            "Vector search returned %s results: %s",
-            len(search_results),
-            [result.table_name for result in search_results],
+            "Vector search tables=%s columns=%s",
+            len(table_hits),
+            len(column_hits),
         )
+        logger.debug("Top tables: %s", [result.table_name for result in table_hits[:10]])
+        logger.debug(
+            "Top columns: %s",
+            [f"{result.table_name}.{result.column_name}" for result in column_hits[:10]],
+        )
+
+    def _rank_tables(
+        self,
+        table_hits: list[SearchResult],
+        column_hits: list[ColumnSearchResult],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        candidates: dict[str, dict[str, Any]] = {}
+
+        for hit in table_hits:
+            payload = candidates.setdefault(
+                hit.table_name,
+                {
+                    "score_components": {
+                        "table_semantic": 0.0,
+                        "column_semantic": 0.0,
+                        "multi_column_boost": 0.0,
+                        "service_penalty": 0.0,
+                        "temporary_penalty": 0.0,
+                    },
+                    "matched_columns": set(),
+                },
+            )
+            payload["score_components"]["table_semantic"] = max(
+                payload["score_components"]["table_semantic"],
+                hit.score,
+            )
+
+        for hit in column_hits:
+            payload = candidates.setdefault(
+                hit.table_name,
+                {
+                    "score_components": {
+                        "table_semantic": 0.0,
+                        "column_semantic": 0.0,
+                        "multi_column_boost": 0.0,
+                        "service_penalty": 0.0,
+                        "temporary_penalty": 0.0,
+                    },
+                    "matched_columns": set(),
+                },
+            )
+            payload["score_components"]["column_semantic"] += hit.score * 0.35
+            payload["matched_columns"].add(hit.column_name)
+
+        ranked: list[tuple[str, dict[str, Any]]] = []
+        for table_name, payload in candidates.items():
+            matched_columns = sorted(payload["matched_columns"])
+            score_components = payload["score_components"]
+            if len(matched_columns) > 1:
+                score_components["multi_column_boost"] = min(
+                    0.3,
+                    (len(matched_columns) - 1) * 0.08,
+                )
+
+            table = self._xdic_parser.tables.get(table_name)
+            if table is not None:
+                if getattr(table, "is_service", False) or getattr(table, "view_type", "") == "Служебная":
+                    score_components["service_penalty"] = -0.25
+                if getattr(table, "is_temporary", False):
+                    score_components["temporary_penalty"] = -0.35
+
+            total_score = sum(score_components.values())
+            ranked.append(
+                (
+                    table_name,
+                    {
+                        "total_score": total_score,
+                        "matched_columns": matched_columns,
+                        "score_components": score_components,
+                    },
+                )
+            )
+
+        ranked.sort(
+            key=lambda item: (item[1]["total_score"], len(item[1]["matched_columns"])),
+            reverse=True,
+        )
+        return ranked
 
     def _load_table_payload(self, table_name: str, score: float) -> dict[str, Any] | None:
         table = self._xdic_parser.tables.get(table_name)

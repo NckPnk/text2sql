@@ -47,9 +47,16 @@ class PromptBuilder:
 
         for table in sorted_tables:
             description = table.description.strip()
+            matched_columns_block = ""
+            if table.matched_columns:
+                matched_columns_block = (
+                    "Matched columns: "
+                    + ", ".join(table.matched_columns[:12])
+                )
             table_block = (
                 f"--- Таблица: {table.name} ---\n"
                 f"{description}\n\n"
+                f"{matched_columns_block}\n\n"
                 f"{table.ddl.strip()}"
             )
             table_block_size = len(table_block)

@@ -1,37 +1,19 @@
 """
-Индексация таблиц из main.xdic в ChromaDB.
-
-Что делает:
-1. Парсит main.xdic → извлекает все таблицы с описаниями
-2. Для каждой таблицы формирует текстовый документ
-3. Получает embedding через Ollama (qwen3-embedding:8b)
-4. Сохраняет в ChromaDB (persistent storage)
-
-Запуск:
-    cd ~/text2sql-zhkh
-    source ../text2sql-env/bin/activate
-    python scripts/index_schema.py
-
-Время: ~5-15 минут на 1313 таблиц.
+Индексация таблиц и колонок из main.xdic в ChromaDB.
 """
 
 import os
 import sys
 import time
-import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 
 import chromadb
 import ollama
 from dotenv import load_dotenv
 
 
-# ─── Конфигурация ────────────────────────────────────────
-
-# Загружаем .env из корня проекта
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -39,13 +21,10 @@ XDIC_PATH = os.getenv("XDIC_PATH", str(PROJECT_ROOT / "data" / "xdic" / "main.xd
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", str(PROJECT_ROOT / "data" / "chroma"))
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:8b")
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "table_schemas")
+TABLE_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "table_schemas")
+COLUMN_COLLECTION_NAME = os.getenv("CHROMA_COLUMN_COLLECTION", "column_schemas")
 
-# Размер батча для embedding (сколько таблиц за один запрос к Ollama)
 BATCH_SIZE = 20
-
-
-# ─── Маппинг типов xdic → PostgreSQL ────────────────────
 
 XDIC_TYPE_MAP = {
     "Текст": "text",
@@ -72,8 +51,6 @@ XDIC_TYPE_MAP = {
 }
 
 
-# ─── Простые модели для парсинга ─────────────────────────
-
 @dataclass
 class FieldInfo:
     name: str
@@ -87,28 +64,21 @@ class FieldInfo:
 class TableInfo:
     name: str
     description: str = ""
-    view_type: str = ""        # Служебная, Временная и т.д.
+    category: str = ""
+    view_type: str = ""
     fields: list[FieldInfo] = field(default_factory=list)
 
     @property
     def is_temporary(self) -> bool:
-        return (
-            self.name.startswith("#")
-            or self.view_type in ("Временная", "ВременнаяДляПользователя")
-        )
+        return self.name.startswith("#") or self.view_type in ("Временная", "ВременнаяДляПользователя")
 
-
-# ─── Парсинг xdic ───────────────────────────────────────
 
 def parse_xdic(path: str) -> list[TableInfo]:
-    """Парсит main.xdic и возвращает список таблиц."""
     print(f"📖 Парсинг {path}...")
-
     tree = ET.parse(path)
     root = tree.getroot()
     tables = []
 
-    # Ищем все <Table> в любом месте дерева
     for table_el in root.iter("Table"):
         name = table_el.get("Имя", "")
         if not name:
@@ -117,17 +87,16 @@ def parse_xdic(path: str) -> list[TableInfo]:
         tbl = TableInfo(
             name=name,
             description=table_el.get("Описание", ""),
+            category=table_el.get("Категория", ""),
             view_type=table_el.get("Вид", ""),
         )
 
-        # Парсим поля
         fields_node = table_el.find("Поля")
         if fields_node is not None:
             for field_el in fields_node.findall("Поле"):
                 fname = field_el.get("Имя", "")
                 if not fname:
                     continue
-
                 ftype = field_el.get("Тип", "")
                 enum_vals = []
                 if ftype in ("Перечисляемое", "Флаги", "Переключатель"):
@@ -135,14 +104,15 @@ def parse_xdic(path: str) -> list[TableInfo]:
                     if raw:
                         enum_vals = [v.strip() for v in raw.split("\\n") if v.strip()]
 
-                fi = FieldInfo(
-                    name=fname,
-                    field_type=ftype,
-                    description=field_el.get("Описание", ""),
-                    referenced_table=field_el.get("Таблица", ""),
-                    enum_values=enum_vals,
+                tbl.fields.append(
+                    FieldInfo(
+                        name=fname,
+                        field_type=ftype,
+                        description=field_el.get("Описание", ""),
+                        referenced_table=field_el.get("Таблица", ""),
+                        enum_values=enum_vals,
+                    )
                 )
-                tbl.fields.append(fi)
 
         tables.append(tbl)
 
@@ -150,227 +120,177 @@ def parse_xdic(path: str) -> list[TableInfo]:
     return tables
 
 
-# ─── Формирование текстового описания ───────────────────
-
 def table_to_document(tbl: TableInfo) -> str:
-    """
-    Формирует текстовый документ для одной таблицы.
-    Этот текст будет embedded и сохранён в ChromaDB.
-    Чем качественнее текст — тем лучше семантический поиск.
-    """
-    parts = []
-
-    # Заголовок
-    parts.append(f"Таблица: {tbl.name}")
+    parts = [f"Таблица: {tbl.name}"]
     if tbl.description:
         parts.append(f"Описание: {tbl.description}")
 
-    # Поля (ограничиваем, чтобы документ не был слишком длинным)
     if tbl.fields:
-        field_lines = []
-        for fi in tbl.fields[:50]:  # Макс 50 полей
+        parts.append("Поля:")
+        for fi in tbl.fields[:50]:
             pg_type = XDIC_TYPE_MAP.get(fi.field_type, fi.field_type)
             line = f"  - {fi.name} ({pg_type})"
             if fi.description:
                 line += f": {fi.description}"
             if fi.referenced_table:
                 line += f" [FK → {fi.referenced_table}]"
-            if fi.enum_values:
-                line += f" [значения: {', '.join(fi.enum_values)}]"
-            field_lines.append(line)
-
-        parts.append("Поля:")
-        parts.extend(field_lines)
-
+            parts.append(line)
         if len(tbl.fields) > 50:
             parts.append(f"  ... и ещё {len(tbl.fields) - 50} полей")
-
-    # Связи (FK)
-    fk_fields = [f for f in tbl.fields if f.field_type == "Внешний ключ"]
-    if fk_fields:
-        parts.append("Связи:")
-        for f in fk_fields:
-            parts.append(f"  - {tbl.name}.{f.name} → {f.referenced_table}")
 
     return "\n".join(parts)
 
 
 def table_to_metadata(tbl: TableInfo) -> dict:
-    """Метаданные для ChromaDB — используются при фильтрации."""
-    fk_tables = [f.referenced_table for f in tbl.fields
-                 if f.field_type == "Внешний ключ" and f.referenced_table]
+    fk_tables = [f.referenced_table for f in tbl.fields if f.field_type == "Внешний ключ" and f.referenced_table]
     return {
         "table_name": tbl.name,
         "name": tbl.name,
         "description": (tbl.description or "")[:500],
         "field_count": len(tbl.fields),
         "fk_count": len(fk_tables),
-        "fk_tables": ", ".join(fk_tables)[:500],  # ChromaDB ограничивает длину
-        "is_service": tbl.view_type == "Служебная",
+        "fk_tables": ", ".join(fk_tables)[:500],
+        "is_service": tbl.view_type == "Служебная" or tbl.category == "Служебная",
         "view_type": tbl.view_type or "regular",
+        "business_category": (tbl.category or "")[:200],
     }
 
 
-# ─── Ollama Embedding ───────────────────────────────────
+def build_canonical_phrase(tbl: TableInfo, field: FieldInfo) -> str:
+    hint = field.description.strip() if field.description else ""
+    if hint:
+        return f"{tbl.name}.{field.name} {hint}"[:240]
+    return f"{tbl.name}.{field.name} column"[:240]
+
+
+def column_to_document(tbl: TableInfo, field: FieldInfo) -> str:
+    pg_type = XDIC_TYPE_MAP.get(field.field_type, field.field_type)
+    fk_target = field.referenced_table or "none"
+    canonical = build_canonical_phrase(tbl, field)
+    return "\n".join(
+        [
+            f"Таблица: {tbl.name}",
+            f"Колонка: {field.name}",
+            f"Описание колонки: {field.description or 'нет описания'}",
+            f"Тип: {pg_type}",
+            f"FK target: {fk_target}",
+            f"Canonical phrase: {canonical}",
+        ]
+    )
+
+
+def column_to_metadata(tbl: TableInfo, field: FieldInfo) -> dict:
+    return {
+        "table_name": tbl.name,
+        "column_name": field.name,
+        "is_fk": bool(field.referenced_table),
+        "referenced_table": field.referenced_table or "",
+        "view_type": tbl.view_type or "regular",
+        "business_category": (tbl.category or "")[:200],
+    }
+
 
 def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """Получает embeddings через Ollama API."""
     client = ollama.Client(host=OLLAMA_URL, timeout=120.0)
     response = client.embed(model=EMBED_MODEL, input=texts)
     return response["embeddings"]
 
 
 def check_ollama() -> bool:
-    """Проверяет доступность Ollama и наличие модели."""
     try:
         client = ollama.Client(host=OLLAMA_URL, timeout=10.0)
         resp = client.list()
-        models = [
-            model.get("name", model.get("model", ""))
-            for model in resp.get("models", [])
-        ]
-
+        models = [model.get("name", model.get("model", "")) for model in resp.get("models", [])]
         if not any(EMBED_MODEL.split(":")[0] in m for m in models):
-            print(f"❌ Модель {EMBED_MODEL} не найдена в Ollama!")
-            print(f"   Доступные модели: {models}")
-            print(f"   Выполните: ollama pull {EMBED_MODEL}")
+            print(f"❌ Модель {EMBED_MODEL} не найдена в Ollama! Доступные: {models}")
             return False
-
-        # Тестовый embedding
         test = get_embeddings(["тест"])
         print(f"   Размерность embedding: {len(test[0])}")
         return True
-    except ConnectionError:
+    except Exception:
         print(f"❌ Ollama недоступна по адресу {OLLAMA_URL}")
-        print(f"   Убедитесь, что Ollama запущена: ollama serve")
         return False
 
 
-# ─── ChromaDB ───────────────────────────────────────────
-
-def init_chroma() -> chromadb.Collection:
-    """Инициализирует ChromaDB и возвращает коллекцию."""
+def init_chroma() -> tuple[chromadb.Collection, chromadb.Collection]:
     print(f"🗄️  ChromaDB: {CHROMA_DIR}")
-
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
-    # Удаляем старую коллекцию (если есть) для чистой переиндексации
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print(f"   Удалена старая коллекция '{COLLECTION_NAME}'")
-    except Exception:
-        pass
+    for collection_name in (TABLE_COLLECTION_NAME, COLUMN_COLLECTION_NAME):
+        try:
+            client.delete_collection(collection_name)
+            print(f"   Удалена старая коллекция '{collection_name}'")
+        except Exception:
+            pass
 
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
+    table_collection = client.create_collection(
+        name=TABLE_COLLECTION_NAME,
         metadata={"description": "Schema tables from xdic dictionary"},
     )
-    print(f"   Создана коллекция '{COLLECTION_NAME}'")
-    return collection
+    column_collection = client.create_collection(
+        name=COLUMN_COLLECTION_NAME,
+        metadata={"description": "Schema columns from xdic dictionary"},
+    )
+    return table_collection, column_collection
 
 
-# ─── Основной процесс ──────────────────────────────────
-
-def main():
-    print("=" * 60)
-    print("  Text2SQL ЖКХ — Индексация схемы в ChromaDB")
-    print("=" * 60)
-    print()
-
-    # 1. Проверяем xdic
-    if not Path(XDIC_PATH).exists():
-        print(f"❌ Файл не найден: {XDIC_PATH}")
-        print(f"   Скопируйте main.xdic в {Path(XDIC_PATH).parent}/")
-        sys.exit(1)
-
-    # 2. Проверяем Ollama + модель
-    print("🔍 Проверка Ollama...")
-    if not check_ollama():
-        sys.exit(1)
-    print("   ✅ Ollama готова")
-    print()
-
-    # 3. Парсим xdic
-    all_tables = parse_xdic(XDIC_PATH)
-
-    # Фильтруем временные таблицы
-    tables = [t for t in all_tables if not t.is_temporary]
-    skipped = len(all_tables) - len(tables)
-    print(f"   Пропущено временных: {skipped}")
-    print(f"   К индексации: {len(tables)}")
-    print()
-
-    # 4. Формируем документы
-    print("📝 Формирование документов...")
-    documents = []
-    metadatas = []
-    ids = []
-
-    for tbl in tables:
-        doc = table_to_document(tbl)
-        meta = table_to_metadata(tbl)
-        documents.append(doc)
-        metadatas.append(meta)
-        ids.append(tbl.name)
-
-    print(f"   Документов: {len(documents)}")
-    avg_len = sum(len(d) for d in documents) / len(documents) if documents else 0
-    print(f"   Средняя длина: {avg_len:.0f} символов")
-    print()
-
-    # 5. Получаем embeddings батчами
-    print(f"🧠 Генерация embeddings (батч по {BATCH_SIZE})...")
-    all_embeddings = []
+def embed_with_progress(documents: list[str], labels: list[str], title: str) -> list[list[float]]:
+    print(f"🧠 Генерация embeddings для {title} (батч по {BATCH_SIZE})...")
+    all_embeddings: list[list[float]] = []
     total_batches = (len(documents) + BATCH_SIZE - 1) // BATCH_SIZE
-
     start_time = time.time()
+    vector_dim = 0
+
     for i in range(0, len(documents), BATCH_SIZE):
         batch = documents[i : i + BATCH_SIZE]
         batch_num = i // BATCH_SIZE + 1
-
         try:
             embeddings = get_embeddings(batch)
+            if embeddings and not vector_dim:
+                vector_dim = len(embeddings[0])
             all_embeddings.extend(embeddings)
-            elapsed = time.time() - start_time
-            speed = len(all_embeddings) / elapsed if elapsed > 0 else 0
-            print(f"   Батч {batch_num}/{total_batches} — "
-                  f"{len(all_embeddings)}/{len(documents)} "
-                  f"({speed:.1f} табл/сек)")
-        except Exception as e:
-            print(f"   ❌ Ошибка в батче {batch_num}: {e}")
-            print(f"   Таблицы: {[t.name for t in tables[i : i + BATCH_SIZE]]}")
-            # Пробуем по одной
+        except Exception as exc:
+            print(f"   ❌ Ошибка в батче {batch_num}: {exc}")
             for j, doc in enumerate(batch):
                 try:
-                    emb = get_embeddings([doc])
-                    all_embeddings.extend(emb)
-                except Exception as e2:
-                    print(f"      Пропущена: {tables[i + j].name} — {e2}")
-                    # Добавляем нулевой вектор, чтобы не сбить индексы
-                    all_embeddings.append([0.0] * len(all_embeddings[0]))
+                    emb = get_embeddings([doc])[0]
+                    if not vector_dim:
+                        vector_dim = len(emb)
+                    all_embeddings.append(emb)
+                except Exception as one_exc:
+                    if not vector_dim:
+                        vector_dim = len(get_embeddings(["тест"])[0])
+                    print(f"      Пропущен объект: {labels[i + j]} — {one_exc}")
+                    all_embeddings.append([0.0] * vector_dim)
 
-    embed_time = time.time() - start_time
-    print(f"   ✅ Embeddings готовы за {embed_time:.1f} сек")
-    print()
+        elapsed = time.time() - start_time
+        speed = len(all_embeddings) / elapsed if elapsed > 0 else 0
+        print(f"   Батч {batch_num}/{total_batches} — {len(all_embeddings)}/{len(documents)} ({speed:.1f}/сек)")
 
-    # 6. Сохраняем в ChromaDB
-    print("💾 Сохранение в ChromaDB...")
-    collection = init_chroma()
+    return all_embeddings
 
-    # ChromaDB тоже лучше добавлять батчами
+
+def add_to_collection(
+    collection: chromadb.Collection,
+    documents: list[str],
+    metadatas: list[dict],
+    ids: list[str],
+    embeddings: list[list[float]],
+) -> None:
     for i in range(0, len(documents), BATCH_SIZE):
         collection.add(
             documents=documents[i : i + BATCH_SIZE],
-            embeddings=all_embeddings[i : i + BATCH_SIZE],
+            embeddings=embeddings[i : i + BATCH_SIZE],
             metadatas=metadatas[i : i + BATCH_SIZE],
             ids=ids[i : i + BATCH_SIZE],
         )
 
-    print(f"   ✅ Сохранено: {collection.count()} таблиц")
-    print()
 
-    # 7. Тестовый поиск
-    print("🔎 Тестовый поиск...")
+def run_test_queries(
+    table_collection: chromadb.Collection,
+    column_collection: chromadb.Collection,
+) -> None:
+    print("🔎 Тестовый поиск по таблицам и колонкам...")
     test_queries = [
         "лицевые счета",
         "приборы учёта",
@@ -378,23 +298,72 @@ def main():
         "адресная иерархия улицы дома",
         "начисления оплата",
     ]
+    for query in test_queries:
+        query_embedding = get_embeddings([query])
+        table_hits = table_collection.query(query_embeddings=query_embedding, n_results=3)
+        column_hits = column_collection.query(query_embeddings=query_embedding, n_results=3)
+        table_names = table_hits["ids"][0] if table_hits["ids"] else []
+        column_names = column_hits["ids"][0] if column_hits["ids"] else []
+        print(f"   «{query}»")
+        print(f"      таблицы: {table_names}")
+        print(f"      колонки: {column_names}")
 
-    for q in test_queries:
-        q_emb = get_embeddings([q])
-        results = collection.query(
-            query_embeddings=q_emb,
-            n_results=3,
-        )
-        names = results["ids"][0] if results["ids"] else []
-        print(f"   «{q}» → {names}")
 
-    print()
+def main() -> None:
+    start_time = time.time()
+    print("=" * 60)
+    print("  Text2SQL ЖКХ — Индексация схемы в ChromaDB")
+    print("=" * 60)
+
+    if not Path(XDIC_PATH).exists():
+        print(f"❌ Файл не найден: {XDIC_PATH}")
+        sys.exit(1)
+
+    print("🔍 Проверка Ollama...")
+    if not check_ollama():
+        sys.exit(1)
+
+    all_tables = parse_xdic(XDIC_PATH)
+    tables = [t for t in all_tables if not t.is_temporary]
+    print(f"   Пропущено временных: {len(all_tables) - len(tables)}")
+    print(f"   К индексации таблиц: {len(tables)}")
+
+    table_documents: list[str] = []
+    table_metadatas: list[dict] = []
+    table_ids: list[str] = []
+
+    column_documents: list[str] = []
+    column_metadatas: list[dict] = []
+    column_ids: list[str] = []
+
+    for tbl in tables:
+        table_documents.append(table_to_document(tbl))
+        table_metadatas.append(table_to_metadata(tbl))
+        table_ids.append(tbl.name)
+
+        for field in tbl.fields:
+            column_documents.append(column_to_document(tbl, field))
+            column_metadatas.append(column_to_metadata(tbl, field))
+            column_ids.append(f"{tbl.name}.{field.name}")
+
+    print(f"📝 Табличных документов: {len(table_documents)}")
+    print(f"📝 Документов по колонкам: {len(column_documents)}")
+
+    table_embeddings = embed_with_progress(table_documents, table_ids, "таблиц")
+    column_embeddings = embed_with_progress(column_documents, column_ids, "колонок")
+
+    table_collection, column_collection = init_chroma()
+
+    print("💾 Сохранение таблиц в ChromaDB...")
+    add_to_collection(table_collection, table_documents, table_metadatas, table_ids, table_embeddings)
+    print("💾 Сохранение колонок в ChromaDB...")
+    add_to_collection(column_collection, column_documents, column_metadatas, column_ids, column_embeddings)
+
+    print(f"   ✅ Таблиц сохранено: {table_collection.count()}")
+    print(f"   ✅ Колонок сохранено: {column_collection.count()}")
+    run_test_queries(table_collection, column_collection)
     total_time = time.time() - start_time
-    print("=" * 60)
-    print(f"  ✅ Индексация завершена за {total_time:.1f} сек")
-    print(f"  📊 Таблиц в ChromaDB: {collection.count()}")
-    print(f"  📁 Данные: {CHROMA_DIR}")
-    print("=" * 60)
+    print(f"⏱️  Общее время: {total_time:.1f} сек")
 
 
 if __name__ == "__main__":

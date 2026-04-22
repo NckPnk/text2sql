@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         default="table_schemas",
         validation_alias="CHROMA_COLLECTION",
     )
+    chroma_column_collection: str = Field(
+        default="column_schemas",
+        validation_alias="CHROMA_COLUMN_COLLECTION",
+    )
 
     xdic_path: str = Field(
         default="./data/xdic/main.xdic",

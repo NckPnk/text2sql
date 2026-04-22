@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from app.core.models import SearchResult
+from app.core.models import ColumnSearchResult, SearchResult
 
 
 @runtime_checkable
@@ -51,6 +51,13 @@ class VectorStore(Protocol):
         n_results: int = 10,
     ) -> list[SearchResult]:
         """Search nearest items for the given query embedding."""
+
+    def search_columns(
+        self,
+        query_embedding: list[float],
+        n_results: int = 20,
+    ) -> list[ColumnSearchResult]:
+        """Search nearest columns for the given query embedding."""
 
 
 __all__ = ["DatabaseClient", "EmbeddingClient", "LLMClient", "VectorStore"]
