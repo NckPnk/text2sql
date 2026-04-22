@@ -9,7 +9,7 @@ import chromadb
 
 from app.core.config import Settings
 from app.core.exceptions import SchemaRetrievalError
-from app.core.models import SearchResult
+from app.core.models import ColumnSearchResult, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +19,15 @@ class ChromaClient:
 
     def __init__(self, settings: Settings):
         self._collection_name = settings.chroma_collection
+        self._column_collection_name = settings.chroma_column_collection
 
         try:
             self._client = chromadb.PersistentClient(path=settings.chroma_path)
             self._collection = self._client.get_collection(self._collection_name)
+            self._column_collection = self._client.get_collection(self._column_collection_name)
         except ValueError as exc:
             raise SchemaRetrievalError(
-                f"Коллекция {self._collection_name} не найдена. "
+                f"Коллекция {self._collection_name} или {self._column_collection_name} не найдена. "
                 "Запустите scripts/index_schema.py"
             ) from exc
         except Exception as exc:
@@ -35,9 +37,11 @@ class ChromaClient:
 
         table_count = self._collection.count()
         logger.info(
-            "ChromaDB collection loaded name=%s tables=%s",
+            "ChromaDB collections loaded tables=%s (%s) columns=%s (%s)",
             self._collection_name,
             table_count,
+            self._column_collection_name,
+            self._column_collection.count(),
         )
 
     def search(
@@ -96,6 +100,46 @@ class ChromaClient:
 
         if not results:
             logger.warning("ChromaDB search returned no results")
+
+        return sorted(results, key=lambda item: item.score, reverse=True)
+
+    def search_columns(
+        self,
+        query_embedding: list[float],
+        n_results: int = 20,
+    ) -> list[ColumnSearchResult]:
+        """Search nearest schema columns for the given embedding."""
+
+        logger.debug("Searching ChromaDB columns n_results=%s", n_results)
+        try:
+            raw = self._column_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as exc:
+            raise SchemaRetrievalError(f"Ошибка поиска колонок в ChromaDB: {exc}") from exc
+
+        ids = self._first_result_list(raw.get("ids"))
+        documents = self._first_result_list(raw.get("documents"))
+        metadatas = self._first_result_list(raw.get("metadatas"))
+        distances = self._first_result_list(raw.get("distances"))
+
+        results: list[ColumnSearchResult] = []
+        for column_id, document, meta, distance in zip(ids, documents, metadatas, distances):
+            metadata = dict(meta or {})
+            table_name = metadata.get("table_name") or str(column_id).split(".", 1)[0]
+            column_name = metadata.get("column_name") or str(column_id).split(".", 1)[-1]
+            distance_value = float(distance)
+            score = 1.0 / (1.0 + distance_value)
+            results.append(
+                ColumnSearchResult(
+                    table_name=table_name,
+                    column_name=column_name,
+                    score=score,
+                    metadata={**metadata, "document": document},
+                )
+            )
 
         return sorted(results, key=lambda item: item.score, reverse=True)
 

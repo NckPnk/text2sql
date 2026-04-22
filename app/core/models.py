@@ -33,6 +33,8 @@ class TableContext(BaseModel):
     description: str = ""
     relevance_score: float = 0.0
     relations: list[str] = Field(default_factory=list)
+    matched_columns: list[str] = Field(default_factory=list)
+    score_components: dict[str, float] = Field(default_factory=dict)
 
 
 class ValidationResult(BaseModel):
@@ -123,6 +125,17 @@ class SearchResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ColumnSearchResult(BaseModel):
+    """A vector store column-level search hit."""
+
+    model_config = ConfigDict(frozen=True)
+
+    table_name: str
+    column_name: str
+    score: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class HealthStatus(BaseModel):
     """Health endpoint payload."""
 
@@ -145,6 +158,7 @@ __all__ = [
     "QueryResponse",
     "SQLResult",
     "SearchResult",
+    "ColumnSearchResult",
     "TableContext",
     "ValidationResult",
 ]
