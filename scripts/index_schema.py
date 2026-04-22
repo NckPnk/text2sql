@@ -286,31 +286,7 @@ def add_to_collection(
         )
 
 
-def run_test_queries(
-    table_collection: chromadb.Collection,
-    column_collection: chromadb.Collection,
-) -> None:
-    print("🔎 Тестовый поиск по таблицам и колонкам...")
-    test_queries = [
-        "лицевые счета",
-        "приборы учёта",
-        "параметры площадь",
-        "адресная иерархия улицы дома",
-        "начисления оплата",
-    ]
-    for query in test_queries:
-        query_embedding = get_embeddings([query])
-        table_hits = table_collection.query(query_embeddings=query_embedding, n_results=3)
-        column_hits = column_collection.query(query_embeddings=query_embedding, n_results=3)
-        table_names = table_hits["ids"][0] if table_hits["ids"] else []
-        column_names = column_hits["ids"][0] if column_hits["ids"] else []
-        print(f"   «{query}»")
-        print(f"      таблицы: {table_names}")
-        print(f"      колонки: {column_names}")
-
-
 def main() -> None:
-    start_time = time.time()
     print("=" * 60)
     print("  Text2SQL ЖКХ — Индексация схемы в ChromaDB")
     print("=" * 60)
@@ -361,9 +337,6 @@ def main() -> None:
 
     print(f"   ✅ Таблиц сохранено: {table_collection.count()}")
     print(f"   ✅ Колонок сохранено: {column_collection.count()}")
-    run_test_queries(table_collection, column_collection)
-    total_time = time.time() - start_time
-    print(f"⏱️  Общее время: {total_time:.1f} сек")
 
 
 if __name__ == "__main__":
