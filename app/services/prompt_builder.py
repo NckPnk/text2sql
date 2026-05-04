@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from app.core.config import Settings
@@ -24,6 +25,7 @@ class PromptBuilder:
             raise PromptBuildError("Файл промта пуст")
 
         self._max_context_chars = 15000
+        self._max_columns_per_table = 18
         logger.info(
             "Системный промт загружен, длина: %s символов",
             len(self._system_prompt),
@@ -53,11 +55,12 @@ class PromptBuilder:
                     "Matched columns: "
                     + ", ".join(table.matched_columns[:12])
                 )
+            pruned_ddl = self._prune_ddl_columns(table.ddl, table.matched_columns)
             table_block = (
                 f"--- Таблица: {table.name} ---\n"
                 f"{description}\n\n"
                 f"{matched_columns_block}\n\n"
-                f"{table.ddl.strip()}"
+                f"{pruned_ddl}"
             )
             table_block_size = len(table_block)
             if context_chars + table_block_size > self._max_context_chars:
@@ -122,3 +125,50 @@ class PromptBuilder:
 
     def estimate_tokens(self, text: str) -> int:
         return len(text) // 3
+
+    def _prune_ddl_columns(self, ddl: str, matched_columns: list[str]) -> str:
+        ddl_clean = ddl.strip()
+        if "(" not in ddl_clean or ")" not in ddl_clean:
+            return ddl_clean
+
+        lines = ddl_clean.splitlines()
+        if len(lines) <= self._max_columns_per_table + 3:
+            return ddl_clean
+
+        column_lines = [line for line in lines[1:-1] if line.strip()]
+        if len(column_lines) <= self._max_columns_per_table:
+            return ddl_clean
+
+        matched_set = {col.lower() for col in matched_columns}
+
+        def line_score(line: str) -> tuple[int, int]:
+            lower = line.lower()
+            col_name_match = re.match(r'\s*"?([\w$а-яА-ЯёЁ]+)"?\s+', line)
+            col_name = col_name_match.group(1).lower() if col_name_match else ""
+            is_matched = 1 if col_name and col_name in matched_set else 0
+            is_join_key = 1 if "foreign key" in lower or col_name.endswith("_id") else 0
+            return (is_matched, is_join_key)
+
+        ranked = sorted(
+            enumerate(column_lines),
+            key=lambda item: (line_score(item[1]), -item[0]),
+            reverse=True,
+        )
+        keep_idx = {idx for idx, _ in ranked[: self._max_columns_per_table]}
+
+        kept_columns = [line for idx, line in enumerate(column_lines) if idx in keep_idx]
+        pruned_count = len(column_lines) - len(kept_columns)
+        if pruned_count <= 0:
+            return ddl_clean
+
+        if kept_columns and kept_columns[-1].rstrip().endswith(","):
+            kept_columns[-1] = kept_columns[-1].rstrip().rstrip(",")
+
+        return "\n".join(
+            [
+                lines[0],
+                *kept_columns,
+                f"    -- pruned {pruned_count} less relevant columns",
+                lines[-1],
+            ]
+        )
