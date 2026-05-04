@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any
 
 from app.core.exceptions import SchemaRetrievalError
@@ -73,6 +74,7 @@ class SchemaRetrievalService:
             expanded_tables[table_name] = table_payload
 
         selected_tables = {**primary_tables, **expanded_tables}
+        selected_tables = self._fill_joinpath_holes(selected_tables, max_tables)
         if not selected_tables:
             raise SchemaRetrievalError("Не удалось получить контекст ни для одной таблицы")
 
@@ -312,3 +314,82 @@ class SchemaRetrievalService:
             return None
 
         return f"{from_table}.{from_field} → {to_table}.{to_field}"
+
+    def _fill_joinpath_holes(
+        self,
+        selected_tables: dict[str, dict[str, Any]],
+        max_tables: int,
+    ) -> dict[str, dict[str, Any]]:
+        if len(selected_tables) < 2 or len(selected_tables) >= max_tables:
+            return selected_tables
+
+        all_table_names = set(getattr(self._xdic_parser, "tables", {}).keys())
+        if not all_table_names:
+            return selected_tables
+
+        selected_names = set(selected_tables)
+        added_tables: dict[str, dict[str, Any]] = {}
+
+        base_pairs = list(selected_names)
+        for i, left in enumerate(base_pairs):
+            for right in base_pairs[i + 1 :]:
+                if len(selected_tables) + len(added_tables) >= max_tables:
+                    break
+                path = self._find_shortest_table_path(left, right, all_table_names)
+                if not path:
+                    continue
+                for table_name in path[1:-1]:
+                    if table_name in selected_names or table_name in added_tables:
+                        continue
+                    if len(selected_tables) + len(added_tables) >= max_tables:
+                        break
+                    table_payload = self._load_table_payload(table_name, score=0.0)
+                    if table_payload is None:
+                        continue
+                    table_payload["matched_columns"] = []
+                    table_payload["score_components"] = {
+                        "joinpath_bridge": 1.0,
+                    }
+                    added_tables[table_name] = table_payload
+
+        if not added_tables:
+            return selected_tables
+
+        logger.info(
+            "Добавлены joinpath-таблицы для устранения разрывов: %s",
+            list(added_tables.keys()),
+        )
+        return {**selected_tables, **added_tables}
+
+    def _find_shortest_table_path(
+        self,
+        start_table: str,
+        end_table: str,
+        allowed_tables: set[str],
+    ) -> list[str]:
+        if start_table == end_table:
+            return [start_table]
+
+        queue: deque[tuple[str, list[str]]] = deque([(start_table, [start_table])])
+        visited = {start_table}
+
+        while queue:
+            current, path = queue.popleft()
+            for neighbor in self._get_neighbor_tables(current):
+                if neighbor not in allowed_tables or neighbor in visited:
+                    continue
+                next_path = path + [neighbor]
+                if neighbor == end_table:
+                    return next_path
+                visited.add(neighbor)
+                queue.append((neighbor, next_path))
+
+        return []
+
+    def _get_neighbor_tables(self, table_name: str) -> set[str]:
+        neighbors: set[str] = set()
+        for relation in self._get_table_relations(table_name):
+            related = self._get_related_table_name(relation, table_name)
+            if related:
+                neighbors.add(related)
+        return neighbors
